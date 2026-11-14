@@ -51,6 +51,7 @@ class UnwindContext:
     tender_ids: tuple
     cfg: object                           # cfg.unwind
     force_flatten: bool = False
+    work_px: Optional[float] = None       # model's working price for the current position (None = unknown)
 
 
 @dataclass
@@ -148,6 +149,14 @@ def plan(ctx: UnwindContext) -> Plan:
     if cfg.sweep and ctx.breakeven is not None and (ph == NORMAL or (ph == ESCALATE and cfg.sweep_in_escalate)):
         edge = float(cfg.min_edge)
         limit = round_price(ctx.breakeven + edge, tick, "up") if selling else round_price(ctx.breakeven - edge, tick, "down")
+        # C: do not sweep below the price the valuation model expects to get by working the shares
+        # (book refill minus slippage and a risk buffer). Only with time in hand: in the last 30
+        # ticks the floor stays at break-even so a late tender is still cleared quickly.
+        if str(getattr(cfg, "sweep_floor", "breakeven")) == "model" and ctx.work_px is not None and ph == NORMAL:
+            if selling:
+                limit = max(limit, round_price(ctx.work_px, tick, "up"))
+            else:
+                limit = min(limit, round_price(ctx.work_px, tick, "down"))
         depth = _depth_at_or_better(levels, limit, selling)
         depth -= sum(o.remaining for o in keep if o.purpose == "sweep" and o not in out.cancels)
         while avail >= 1 and depth >= min(min_child, avail) and len(out.places) < int(cfg.max_places_per_loop):

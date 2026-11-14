@@ -29,7 +29,7 @@ from .logs import HeatLogger
 from .marketdata import (Book, SecurityInfo, Tender, parse_book, parse_securities, parse_tender,
                          tick_size_from_decimals)
 from .tracker import OrderTracker, TrackedOrder
-from .valuation import Evaluation, LiqParams, decide, evaluate_tender
+from .valuation import Evaluation, LiqParams, decide, evaluate_tender, liquidation_value
 
 
 @dataclass
@@ -541,6 +541,15 @@ class Engine:
                          slippage_ticks=float(tc.slippage_ticks), dump_penalty=float(tc.dump_penalty),
                          ticks_available=ticks_avail)
 
+    def _work_px(self, ticker: str, pos: int, book: Book) -> Optional[float]:
+        if pos == 0 or not book.bids or not book.asks:
+            return None
+        try:
+            _, det = liquidation_value(pos, book.bids, book.asks, self._liq_params(ticker))
+        except Exception:  # noqa: BLE001
+            return None
+        return det.get("later_px")
+
     def evaluate(self, t: Tender) -> Evaluation:
         b = self.snap.books.get(t.ticker) or Book(t.ticker)
         ctx = self.gate_context()
@@ -823,7 +832,7 @@ class Engine:
                 sigma_prior=h.vol_prior, competitors=self.competitors(t),
                 start_tick=start if start is not None else s.tick, last_schedule_tick=self.last_schedule_tick[t],
                 ref_mid=h.ewma_mid, tender_ids=tuple(self.ledger.tender_ids(t)), cfg=uc,
-                force_flatten=self.kill == "flatten")
+                force_flatten=self.kill == "flatten", work_px=self._work_px(t, p, b))
             plan = unwind_mod.plan(ctx)
             self.phase[t] = plan.phase
             self.unwind_notes[t] = "; ".join(plan.notes)

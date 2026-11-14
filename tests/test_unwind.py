@@ -5,7 +5,8 @@ from bot.unwind import ESCALATE, FLATTEN, NORMAL, UnwindContext, phase_for, plan
 
 from helpers import BRIEF_ASKS, BRIEF_BIDS
 
-CFG = load_config()
+CFG = load_config(overrides={"unwind.min_edge": 0.0, "unwind.sweep_floor": "breakeven"})   # v1 sweep rules
+CFG2 = load_config()
 
 
 def uctx(**kw):
@@ -103,3 +104,24 @@ def test_passive_inside_spread():
     p = plan(uctx(breakeven=None, bids=[(9.95, 500)], asks=[(10.00, 5000)]))
     pas = [r for r in p.places if r.purpose == "passive"]
     assert pas and pas[0].price == 9.99 and pas[0].action == "SELL"
+
+
+def test_model_floor_stops_the_sweep_at_the_working_price():
+    """Break-even 9.80, but the model expects 9.96 by working the shares: only the 9.98 level is swept."""
+    p = plan(uctx(cfg=CFG2.unwind, breakeven=9.80, work_px=9.957))
+    sweeps = [r for r in p.places if r.purpose == "sweep"]
+    assert sum(r.qty for r in sweeps) == 8000 and sweeps[0].price == 9.96
+    assert sum(r.qty for r in p.places) <= 50000 and any(r.purpose == "passive" for r in p.places)
+
+
+def test_model_floor_never_goes_below_breakeven_plus_min_edge_and_is_off_in_the_last_30_ticks():
+    p = plan(uctx(cfg=CFG2.unwind, breakeven=9.94, work_px=9.80))
+    assert all(r.price == 9.98 for r in p.places if r.purpose == "sweep")          # 9.94 + 0.04
+    late = plan(uctx(cfg=CFG2.unwind, breakeven=9.80, work_px=9.957, tick=275, start_tick=272))
+    assert sum(r.qty for r in late.places if r.purpose == "sweep") == 50000        # floor back at 9.84
+
+
+def test_model_floor_for_a_short():
+    p = plan(uctx(cfg=CFG2.unwind, pos=-30000, breakeven=10.30, work_px=10.035, ref_mid=10.0))
+    sweeps = [r for r in p.places if r.purpose == "sweep"]
+    assert sum(r.qty for r in sweeps) == 8000 and sweeps[0].price == 10.03

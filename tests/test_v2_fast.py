@@ -23,6 +23,10 @@ def test_sweep_runs_in_the_last_30_ticks():
     assert sum(r.qty for r in p.places if r.purpose == "sweep") == 33000
 
 
+def test_v2_defaults():
+    assert CFG.fees.on_tender is False and CFG.unwind.min_edge == 0.04 and CFG.unwind.sweep_floor == "model"
+
+
 def test_idle_loop_uses_two_requests_and_sweep_follows_accept_in_the_same_loop():
     m = SimMarket(3, tenders=[TenderSpec(20, "CRZY", "BUY", 60000, 0.25)])
     c = SimClient(m)

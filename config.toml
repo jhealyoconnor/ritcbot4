@@ -38,7 +38,7 @@ TAME = 10000
 
 [fees]
 per_share = 0.02           # fee on every market trade (server trading_fee used if larger)
-on_tender = true           # assume the fee also applies to the tender trade (logged so you can confirm)
+on_tender = false          # confirmed live: 13 tender rows in the server log, none charged a fee
 
 [tender]
 min_ev_per_share = 0.005   # accept only if expected P&L per share >= this ...
@@ -67,7 +67,7 @@ TAME = 0.02
 
 [unwind]
 sweep = true               # on accept, immediately take every visible share priced better than break-even
-min_edge = 0.0             # sweep floor = break-even (tender +/- both fees) +/- this
+min_edge = 0.04            # sweep floor = break-even +/- this (0.04 beat 0 in replay and simulation)
 min_horizon_ticks = 4
 max_horizon_ticks = 60
 vol_urgency = 1.0          # horizon scaled by (vol_prior / vol_measured) ^ this
@@ -79,6 +79,7 @@ passive_fraction = 0.25    # passive order size as a fraction of the position
 passive_max_age_ticks = 3
 stale_ticks = 2            # cancel unfilled marketable remnants after this many ticks
 escalate_ticks_before_end = 30
+sweep_floor = "model"       # proven v2 default. "model" = never sweep below the model's working price; "breakeven" = v1 behaviour
 sweep_in_escalate = true   # last 30 ticks: still sweep everything at or better than break-even first
 escalate_slip_ticks = 5    # in the escalation window, price this many ticks through the touch
 market_ticks_before_end = 10
