@@ -94,3 +94,62 @@ def test_summary_has_per_tender_pnl_from_server_transactions_and_survives_401():
     assert abs(sum(x["realised"] for x in tx["tenders"]) - m.nlv(m.bot)) < 0.5
     assert abs(s["final_pnl"] - m.nlv(m.bot)) < 0.5 and s["final_pnl_source"] == "server transactions"
     assert all(x["predicted_ev"] is not None for x in tx["tenders"]) and "FINAL P&L" in text
+
+
+def test_competitor_estimate_waits_for_trade_data_and_is_capped():
+    from bot.history import TickerHistory
+    h = TickerHistory("CRZY", 0.04, 3000)
+    h.require_tas_coverage = True
+    h.watch_tender(1, 100, 50000, "SELL", [(10.0, 5000)], [(10.1, 5000)])
+    assert h.update_watches(111, [(10.0, 5000)], [(10.1, 5000)]) == [] and h.competitor_est is None   # no trade data yet
+    h.on_tas([{"id": 5, "tick": 99, "quantity": 100}] + [{"id": 10 + k, "tick": 100 + k, "quantity": 10000} for k in range(11)])
+    h.on_tas([{"id": 20, "tick": 110, "quantity": 10000}])          # repeated row (inclusive 'after') is ignored
+    (res,) = h.update_watches(113, [(10.0, 5000)], [(10.1, 5000)])
+    assert res["other_volume"] == 110000 and 2.0 < h.competitor_est < 2.3
+    cfg = load_config(overrides={"tender.competitor_cap": 1.0})
+    eng = Engine(SimClient(SimMarket(1, tenders=[])), cfg, mode="sim", clock=FakeClock(), parallel=False)
+    eng.history["CRZY"].competitor_est = 7.5
+    assert eng.competitors("CRZY") == 1.0
+
+
+def test_passive_jitter_improves_by_one_extra_tick_only_when_there_is_room():
+    wide = dict(breakeven=None, bids=[(9.90, 500)], asks=[(10.00, 5000)])
+    base = [r for r in plan(uctx(**wide)).places if r.purpose == "passive"][0].price
+    jit = [r for r in plan(uctx(jitter=1, **wide)).places if r.purpose == "passive"][0].price
+    assert (base, jit) == (9.99, 9.98)
+    tight = dict(breakeven=None, bids=[(9.98, 500)], asks=[(10.00, 5000)])
+    assert [r for r in plan(uctx(jitter=1, **tight)).places if r.purpose == "passive"][0].price == 9.99
+    short = dict(pos=-20000, breakeven=None, bids=[(9.90, 500)], asks=[(10.00, 5000)], ref_mid=9.95)
+    assert [r for r in plan(uctx(jitter=1, **short)).places if r.purpose == "passive"][0].price == 9.92
+
+
+def test_endgame_starts_earlier_on_a_slow_link():
+    eng = Engine(SimClient(SimMarket(1, tenders=[])), CFG, mode="sim", clock=FakeClock(), parallel=False)
+    eng.snap.ticks_per_period = 300
+    eng.loop_secs = 0.8
+    assert eng.unwind_end_tick() == 300                      # fast loop: unchanged
+    eng.loop_secs = 3.0
+    assert eng.unwind_end_tick() == 300 - 12                 # 6 loops x 3 ticks + 4 = 22 ticks -> 12 earlier
+    eng.loop_secs = 30.0
+    assert eng.unwind_end_tick() == 300 - CFG.unwind.flatten_max_extra_ticks
+
+
+def test_stale_tender_list_is_rechecked_before_an_order_when_enabled():
+    cfg = load_config(overrides={"risk.max_tender_age": 0.2})
+    m = SimMarket(3, tenders=[TenderSpec(5, "TAME", "BUY", 90000, 0.25), TenderSpec(8, "TAME", "BUY", 5000, 0.0)])
+    c = SimClient(m)
+    clock = FakeClock()
+    eng = Engine(c, cfg, mode="sim", clock=clock, parallel=False)
+    eng.startup()
+    while m.tick < 7:
+        clock.t += 1.0
+        eng.run_once()
+        m.step()
+    eng.run_once()
+    assert m.accounts[m.bot].positions["TAME"] > 0
+    m.step()                                   # tick 8: a second TAME tender appears, unseen by the bot
+    clock.t += 5.0                             # ... and its tender list is now stale
+    from bot.gate import OrderRequest
+    pos = m.accounts[m.bot].positions["TAME"]
+    assert eng.send(OrderRequest("TAME", "SELL", min(1000, pos), "MARKET", None, "schedule")) is None
+    assert "TAME" in eng.frozen and m.violations == []

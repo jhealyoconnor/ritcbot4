@@ -51,6 +51,8 @@ risk_lambda = 0.3          # inventory-risk buffer: lambda * sigma * sqrt(unwind
 slippage_ticks = 1.0       # expected slippage (in price ticks) on shares worked as the book refills
 dump_penalty = 0.10        # $/share haircut beyond visible depth if forced to dump at the end
 competitors = 0.0          # assumed other traders unwinding the same tender (refill is shared)
+competitor_cap = 99.0      # largest competitor count allowed to affect EV and unwind speed
+competitor_wait_for_trades = false  # measure competitors only once trade data covers the 10 ticks after a tender
 auto_competitors = true    # raise the competitor estimate when depth drains after tenders
 
 [tender.ref_depth]         # shares used for the refill reference price (VWAP of the top N shares)
@@ -75,6 +77,7 @@ depth_fraction = 0.6       # a child order takes at most this share of visible d
 slip_ticks = 1             # schedule orders priced this many ticks through the touch
 min_child = 100            # never send orders smaller than this (except the final clean-up)
 passive = true             # also rest one limit order inside the spread while there is time
+passive_jitter = false     # random extra tick of price improvement on the resting order (vs identical teammate bots)
 passive_fraction = 0.25    # passive order size as a fraction of the position
 passive_max_age_ticks = 3
 stale_ticks = 2            # cancel unfilled marketable remnants after this many ticks
@@ -83,6 +86,8 @@ sweep_floor = "model"       # proven v2 default. "model" = never sweep below the
 sweep_in_escalate = true   # last 30 ticks: still sweep everything at or better than break-even first
 escalate_slip_ticks = 5    # in the escalation window, price this many ticks through the touch
 market_ticks_before_end = 10
+flatten_min_loops = 6       # slow link: start the endgame early enough to leave this many loops for market orders
+flatten_max_extra_ticks = 25 # ... but never more than this many ticks earlier
 max_places_per_loop = 8
 
 [unwind.horizon_ticks]     # baseline time to work a fresh tender
@@ -100,6 +105,7 @@ stale_data_seconds = 3.0
 strict_freeze = true       # pending tender: freeze ALL new orders in that stock and cancel ALL its resting orders
 tick_window = true         # send orders only after re-reading tenders this tick, and not near the next tick boundary
 tick_window_margin = 0.08  # seconds kept clear before the estimated next tick boundary
+max_tender_age = 999.0     # seconds: re-read tenders before an order if the last read is older (0.45 tested: cost ~2k/heat, not kept)
 tick_boundary_guard = false # also hold orders back near the next tick boundary (slows unwinding on a 250 ms link)
 tick_seconds_prior = 1.0   # initial estimate of seconds per tick (learned live)
 tick_window_max_skip = 2   # if the window stayed shut this many ticks (slow link), send anyway after re-reading tenders

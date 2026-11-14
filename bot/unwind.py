@@ -51,6 +51,7 @@ class UnwindContext:
     tender_ids: tuple
     cfg: object                           # cfg.unwind
     force_flatten: bool = False
+    jitter: int = 0                       # 0/1: extra tick of price improvement on the resting order
     work_px: Optional[float] = None       # model's working price for the current position (None = unknown)
 
 
@@ -200,10 +201,14 @@ def plan(ctx: UnwindContext) -> Plan:
         bb, ba = ctx.bids[0][0], ctx.asks[0][0]
         if selling:
             px = ba - tick if ba - bb > tick + 1e-9 else ba
+            if ctx.jitter and px - tick > bb + tick - 1e-9:      # random extra tick: queue ahead of identical bots
+                px -= tick
             px = round_price(px, tick, "up")
             ok = px > bb + 1e-9
         else:
             px = bb + tick if ba - bb > tick + 1e-9 else bb
+            if ctx.jitter and px + tick < ba - tick + 1e-9:
+                px += tick
             px = round_price(px, tick, "down")
             ok = px < ba - 1e-9
         q = int(min(avail, ctx.max_order, math.ceil(float(cfg.passive_fraction) * size)))

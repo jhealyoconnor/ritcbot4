@@ -228,12 +228,10 @@ class RitClient:
     def book(self, ticker: str, limit: int = 30) -> Result:
         return self.call("GET", "securities/book", {"ticker": ticker, "limit": limit})
 
-    def tas(self, ticker: str, after: Optional[int] = None) -> Result:
-        params: Dict[str, Any] = {"ticker": ticker}
+    def tas(self, ticker: str, after: Optional[int] = None, limit: Optional[int] = None) -> Result:
+        params: Dict[str, Any] = {"ticker": ticker, "limit": limit if limit is not None else (1000 if after is not None else 50)}
         if after is not None:
             params["after"] = after
-        else:
-            params["limit"] = 50
         return self.call("GET", "securities/tas", params)
 
     def orders(self, status: str = "OPEN") -> Result:

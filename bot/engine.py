@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import time
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -99,6 +100,9 @@ class Engine:
         self.tick_boundary_lo = 0.0
         self.tenders_verified_tick = -1
         self.deferred_sends = 0
+        self.t_tenders = -1e9                 # when the tender list was last read
+        self.loop_secs = 0.6                  # recent duration of a loop while holding a position
+        self._loop_full = False
         self._window_closed_since: Optional[int] = None
         self._reset_heat()
 
@@ -110,6 +114,9 @@ class Engine:
         tc = self.cfg.tender
         self.history = {t: TickerHistory(t, float(getattr(tc.vol_prior, t, 0.03)),
                                          float(getattr(tc.refill_prior, t, 2000))) for t in self.tickers}
+        for h in self.history.values():
+            h.require_tas_coverage = bool(tc.competitor_wait_for_trades)
+        self.rng = random.Random(f"{getattr(self, 'own_id', None)}-{getattr(self, 'heat_no', 0)}")
         self.decisions: Dict[int, TenderRecord] = {}
         self.snap = Snapshot(net_limit=int(self.cfg.case.net_limit), gross_limit=int(self.cfg.case.gross_limit))
         self.frozen: Set[str] = set()
@@ -229,7 +236,7 @@ class Engine:
     def competitors(self, ticker: str) -> float:
         base = float(self.cfg.tender.competitors)
         est = self.history[ticker].competitor_est if self.cfg.tender.auto_competitors else None
-        return max(base, est or 0.0)
+        return min(float(self.cfg.tender.competitor_cap), max(base, est or 0.0))
 
     def gate_context(self) -> GateContext:
         s = self.snap
@@ -307,8 +314,27 @@ class Engine:
                        tender_ids=list(to.tender_ids))
 
     # =================================================================== loop
+    def unwind_end_tick(self) -> int:
+        """The end tick the unwind schedule works to. On a slow link every phase (escalation, market
+        orders) starts earlier, so that at least ~6 loops remain for the final market orders."""
+        loop_ticks = self.loop_secs / max(0.2, self.tick_len)
+        need = math.ceil(float(self.cfg.unwind.flatten_min_loops) * loop_ticks) + 4
+        extra = min(int(self.cfg.unwind.flatten_max_extra_ticks),
+                    max(0, need - int(self.cfg.unwind.market_ticks_before_end)))
+        return self.end_tick() - extra
+
     def run_once(self) -> str:
+        t_loop = self.clock()
+        try:
+            return self._run_once()
+        finally:
+            dt = self.clock() - t_loop
+            if self._loop_full and 0.0 < dt < 30.0:
+                self.loop_secs = 0.7 * self.loop_secs + 0.3 * dt if dt < self.loop_secs else max(dt, 0.5 * self.loop_secs + 0.5 * dt)
+
+    def _run_once(self) -> str:
         self.loop += 1
+        self._loop_full = False
         # idle (flat, nothing resting, no tender): only tick + tenders, so a new tender is seen fast
         full = (not self.heat_started or bool(self.snap.tenders) or bool(self.accept_pending)
                 or bool(self.tracker.live()) or bool(self.tracker.foreign)
@@ -348,6 +374,7 @@ class Engine:
             self.snap.tenders = [parse_tender(t, self.tickers, str(self.cfg.tender.action_fallback))
                                  for t in (r["tenders"].data or [])]
             self.tenders_verified_tick = self.snap.tick
+            self.t_tenders = self.clock()
         s.t_ok = self.clock()
         self.degraded = self.err_count >= int(self.cfg.risk.max_consecutive_errors)
         if not self.heat_started:
@@ -357,6 +384,7 @@ class Engine:
             self._log_tick()
             return "EXIT" if self.exit_requested else "ACTIVE"
 
+        self._loop_full = any(self.pos(t) != 0 for t in self.tickers)
         self._read_books()
         self._update_history_and_ledger()
         self._check_kill_and_risk()
@@ -423,6 +451,7 @@ class Engine:
     def _start_heat(self) -> None:
         self.heat_started = True
         self.heat_no += 1
+        self.rng = random.Random(f"{self.own_id}-{self.heat_no}")     # differs per trader, so teammates differ
         self.t_heat_start = self.clock()
         self.req_start = self.client.stats.count if hasattr(self.client, "stats") else 0
         try:
@@ -463,6 +492,7 @@ class Engine:
                     self.snap.tenders = [parse_tender(x, self.tickers, str(self.cfg.tender.action_fallback))
                                          for x in (res.data or [])]
                     self.tenders_verified_tick = self.snap.tick
+                    self.t_tenders = self.clock()
                 continue
             if isinstance(res, Exception):
                 self.warn(f"book {t}: {res}")
@@ -536,7 +566,7 @@ class Engine:
     def _liq_params(self, ticker: str) -> LiqParams:
         tc = self.cfg.tender
         h = self.history[ticker]
-        ticks_avail = max(0, self.end_tick() - int(self.cfg.unwind.market_ticks_before_end) - self.snap.tick)
+        ticks_avail = max(0, self.unwind_end_tick() - int(self.cfg.unwind.market_ticks_before_end) - self.snap.tick)
         return LiqParams(fee=self.fee(ticker), tick=self.tick_size(ticker),
                          ref_depth=int(getattr(tc.ref_depth, ticker, 10000)), sigma=h.sigma(), refill=h.refill(),
                          competitors=self.competitors(ticker), risk_lambda=float(tc.risk_lambda),
@@ -723,6 +753,12 @@ class Engine:
         if not self.send_window_open(req.purpose):
             self.deferred_sends += 1
             return None
+        if not self.dry and self.clock() - self.t_tenders > float(self.cfg.risk.max_tender_age):
+            # the tender list is no longer fresh (slow link or a long burst of orders): look again
+            # before trading, so no order goes out after a tender has appeared in this stock
+            if not self._recheck_tenders():
+                self.deferred_sends += 1
+                return None
         ok, reason = gate_mod.check(req, self.gate_context())
         if not ok:
             self.blocked[reason.split(":")[0]] += 1
@@ -757,6 +793,22 @@ class Engine:
             self._fill(o, dq, dc)
         self._log_order("SENT", to, latency_ms=round((self.clock() - t0) * 1000))
         return to
+
+    def _recheck_tenders(self) -> bool:
+        try:
+            res = self.client.tenders()
+        except (ApiError, TransportError) as exc:
+            self.warn(f"tender re-check failed, holding orders: {str(exc)[:80]}")
+            return False
+        self.snap.tenders = [parse_tender(x, self.tickers, str(self.cfg.tender.action_fallback))
+                             for x in (res.data or [])]
+        self.t_tenders = self.clock()
+        self.tenders_verified_tick = self.snap.tick
+        for t in self.snap.tenders:
+            rec = self.decisions.get(t.tender_id)
+            if (rec is None or not rec.final) and t.ticker in self.tickers:
+                self.frozen.add(t.ticker)          # the gate now blocks this stock until the tender is decided
+        return True
 
     def _log_order(self, event: str, to: TrackedOrder, **extra) -> None:
         self.log.order(tick=self.snap.tick, event=event, local_id=to.local_id, order_id=to.order_id, ticker=to.ticker,
@@ -827,14 +879,15 @@ class Engine:
             h = self.history[t]
             start = self.ledger.unwind_start(t)
             ctx = unwind_mod.UnwindContext(
-                ticker=t, tick=s.tick, end_tick=self.end_tick(), pos=p,
+                ticker=t, tick=s.tick, end_tick=self.unwind_end_tick(), pos=p,
                 committed=self.tracker.committed(t, "SELL" if p > 0 else "BUY", s.pos_sent) if p else 0.0,
                 live=live, foreign=foreign, bids=b.bids, asks=b.asks, tick_size=self.tick_size(t),
                 max_order=self.max_order(t), breakeven=self.ledger.breakeven(t), sigma=h.sigma(),
                 sigma_prior=h.vol_prior, competitors=self.competitors(t),
                 start_tick=start if start is not None else s.tick, last_schedule_tick=self.last_schedule_tick[t],
                 ref_mid=h.ewma_mid, tender_ids=tuple(self.ledger.tender_ids(t)), cfg=uc,
-                force_flatten=self.kill == "flatten", work_px=self._work_px(t, p, b))
+                force_flatten=self.kill == "flatten", work_px=self._work_px(t, p, b),
+                jitter=self.rng.randint(0, 1) if bool(uc.passive_jitter) else 0)
             plan = unwind_mod.plan(ctx)
             self.phase[t] = plan.phase
             self.unwind_notes[t] = "; ".join(plan.notes)
@@ -850,6 +903,9 @@ class Engine:
         if self.snap.tick >= self.end_tick() - 8 and not self.tracker.live() \
                 and all(self.pos(t) == 0 for t in self.tickers):
             every = 2                    # capture the last transactions before the heat closes
+        busy = bool(self.tracker.live()) or any(self.pos(t) != 0 for t in self.tickers)
+        if busy and self.snap.tick >= self.unwind_end_tick() - int(self.cfg.unwind.escalate_ticks_before_end):
+            return                       # final stretch with a position: every request goes to the unwind
         if self.loop % every != 0:
             return
         calls: List[Tuple[str, Callable]] = [("limits", self.client.limits), ("trader", self.client.trader),

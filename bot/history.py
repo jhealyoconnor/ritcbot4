@@ -48,6 +48,10 @@ class TickerHistory:
         self.watches: List[TenderWatch] = []
         self.competitor_est: Optional[float] = None
         self.last_tick = -1
+        self.tas_last_id = -1
+        self.tas_seen_id = -1
+        self.tas_max_tick = -1
+        self.require_tas_coverage = False
 
     # --------------------------------------------------------------- books
     def on_book(self, tick: int, bids, asks, tick_size: float) -> None:
@@ -99,8 +103,15 @@ class TickerHistory:
     # ------------------------------------------------------------- volume
     def on_tas(self, trades) -> None:
         for tr in trades or []:
+            tid = tr.get("id")
+            if tid is not None:
+                if int(tid) <= self.tas_last_id:      # the live server repeats the row with id == after
+                    continue
+                self.tas_seen_id = max(self.tas_seen_id, int(tid))
             t = int(tr.get("tick", 0))
+            self.tas_max_tick = max(self.tas_max_tick, t)
             self.volume[t] = self.volume.get(t, 0.0) + float(tr.get("quantity", 0) or 0)
+        self.tas_last_id = self.tas_seen_id
 
     def on_own_fill(self, tick: int, qty: float, action: str = "") -> None:
         self.own[tick] = self.own.get(tick, 0.0) + qty
@@ -125,6 +136,11 @@ class TickerHistory:
         finished = []
         for w in self.watches:
             if w.done or tick < w.tick0 + w.window:
+                continue
+            if self.require_tas_coverage and self.tas_max_tick < w.tick0 + w.window:
+                # trade data for the window has not arrived yet: measuring now would read 0
+                if tick > w.tick0 + w.window + 40:
+                    w.done = True                      # never arrived: no estimate rather than a wrong one
                 continue
             others = sum(max(0.0, self.volume.get(t, 0.0) - self.own.get(t, 0.0))
                          for t in range(w.tick0, w.tick0 + w.window + 1))
