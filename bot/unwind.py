@@ -145,7 +145,7 @@ def plan(ctx: UnwindContext) -> Plan:
     min_child = int(cfg.min_child)
 
     # 1. SWEEP everything priced better than break-even
-    if cfg.sweep and ctx.breakeven is not None and ph == NORMAL:
+    if cfg.sweep and ctx.breakeven is not None and (ph == NORMAL or (ph == ESCALATE and cfg.sweep_in_escalate)):
         edge = float(cfg.min_edge)
         limit = round_price(ctx.breakeven + edge, tick, "up") if selling else round_price(ctx.breakeven - edge, tick, "down")
         depth = _depth_at_or_better(levels, limit, selling)

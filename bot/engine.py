@@ -307,11 +307,18 @@ class Engine:
     # =================================================================== loop
     def run_once(self) -> str:
         self.loop += 1
-        try:
-            r = self._par([("case", self.client.case), ("tenders", self.client.tenders),
-                           ("sec", self.client.securities), ("orders", lambda: self.client.orders("OPEN"))])
-        except AuthError:
-            raise
+        # idle (flat, nothing resting, no tender): only tick + tenders, so a new tender is seen fast
+        full = (not self.heat_started or bool(self.snap.tenders) or bool(self.accept_pending)
+                or bool(self.tracker.live()) or bool(self.tracker.foreign)
+                or any(self.pos(t) != 0 for t in self.tickers)
+                or self.loop % int(self.cfg.requests.idle_book_every) == 0)
+        calls = [("case", self.client.case), ("tenders", self.client.tenders)]
+        if full:
+            calls += [("sec", self.client.securities), ("orders", lambda: self.client.orders("OPEN"))]
+        r = self._par(calls)
+        if not full and not isinstance(r.get("tenders"), Exception) and (r["tenders"].data or []):
+            r.update(self._par([("sec", self.client.securities), ("orders", lambda: self.client.orders("OPEN"))]))
+            full = True
         failed = [k for k, v in r.items() if isinstance(v, Exception)]
         if "case" in failed:
             self._error(f"read case failed: {r['case']}")
@@ -332,15 +339,21 @@ class Engine:
                 return "ERROR"
         else:
             self.err_count = 0
-        self._apply_securities(r["sec"])
-        self._apply_orders(r["orders"])
+        if full:
+            self._apply_securities(r["sec"])
+            self._apply_orders(r["orders"])
         if not isinstance(r.get("tenders"), Exception):
             self.snap.tenders = [parse_tender(t, self.tickers, str(self.cfg.tender.action_fallback))
                                  for t in (r["tenders"].data or [])]
+            self.tenders_verified_tick = self.snap.tick
         s.t_ok = self.clock()
         self.degraded = self.err_count >= int(self.cfg.risk.max_consecutive_errors)
         if not self.heat_started:
             self._start_heat()
+        if not full:
+            self._check_kill_and_risk()
+            self._log_tick()
+            return "EXIT" if self.exit_requested else "ACTIVE"
 
         self._read_books()
         self._update_history_and_ledger()
@@ -387,6 +400,8 @@ class Engine:
             return True
         if self.tenders_verified_tick != self.snap.tick:
             return False
+        if not bool(self.cfg.risk.tick_boundary_guard):
+            return True                      # tenders were re-read in this tick: send now
         now = self.clock()
         if now + 0.5 * self._latency() + float(self.cfg.risk.tick_window_margin) < self.tick_boundary_lo + self.tick_len:
             self._window_closed_since = None
@@ -892,6 +907,9 @@ class Engine:
         if stats is not None:
             rec["rps"] = round(stats.per_second(), 2)
             rec["latency_ms"] = round((stats.latency_ewma or 0) * 1000, 1)
+        if stats is not None:
+            rec["rate_limited_429"] = stats.rate_limited
+            rec["req_rate_budget"] = round(getattr(self.client.limiter, "rate", 0), 1) if hasattr(self.client, "limiter") else None
         if s.tick != self.last_logged_tick:
             n = int(self.cfg.logging.book_levels)
             rec["books"] = {t: {"bids": b.bids[:n], "asks": b.asks[:n], "own_bids": b.own_bids, "own_asks": b.own_asks}
@@ -904,8 +922,16 @@ class Engine:
         self.log.tick(rec)
 
     # ============================================================== heat end
-    def _end_heat(self, why: str) -> None:
-        if not self.dry:
+    def auth_lost(self) -> bool:
+        """The server answers 401 between heats. If a heat was running, close it out (summary and
+        logs) without touching the server; return True so the caller waits and logs in again."""
+        if not self.heat_started:
+            return self.heat_no > 0
+        self._end_heat("heat over (server returned 401)", cancel=False)
+        return True
+
+    def _end_heat(self, why: str, cancel: bool = True) -> None:
+        if not self.dry and cancel:
             self._cancel_all(f"heat end: {why}")
         summary, text = self.summary(why)
         self.summaries.append(summary)

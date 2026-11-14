@@ -6,22 +6,22 @@
 
 [connection]
 host = "flserver.rotman.utoronto.ca"   # overridden by --host or RIT_HOST
-connect_timeout = 2.0                  # seconds
-read_timeout = 3.0                     # seconds
-max_get_retries = 3                    # retries for reads / cancels / declines on dropped connections
+connect_timeout = 1.0                  # seconds (fail fast: the next loop is the retry)
+read_timeout = 1.2                     # seconds
+max_get_retries = 0                    # no retries inside a loop, so nothing can stall for more than ~2 s
 backoff_base = 0.2                     # seconds, doubles each retry
-max_429_retries = 20
+max_429_retries = 4
 workers = 4                            # parallel read threads sharing one keep-alive Session
 
 [requests]
-initial_rate = 20.0       # requests/second budget at start; adapts from 429 responses
+initial_rate = 10.0      # requests/second budget at start; adapts from 429 responses
 min_rate = 3.0
 max_rate = 40.0
-increase_per_sec = 0.5    # additive increase per second without a 429
-decrease_factor = 0.7     # multiplicative decrease on each 429
+increase_per_sec = 1.5    # additive increase per second without a 429
+decrease_factor = 0.85    # multiplicative decrease per burst of 429s (a burst counts once)
 loop_period = 0.25        # target seconds per main loop (server tick is ~1 s)
 book_levels = 30          # levels requested per side of each book
-idle_book_every = 4       # books for stocks with no position/tender: every N loops
+idle_book_every = 4       # when flat with no tender: positions, open orders and books only every N loops
 aux_every = 8             # limits / trader NLV / transactions / time&sales: every N loops
 
 [case]
@@ -79,9 +79,10 @@ passive_fraction = 0.25    # passive order size as a fraction of the position
 passive_max_age_ticks = 3
 stale_ticks = 2            # cancel unfilled marketable remnants after this many ticks
 escalate_ticks_before_end = 30
+sweep_in_escalate = true   # last 30 ticks: still sweep everything at or better than break-even first
 escalate_slip_ticks = 5    # in the escalation window, price this many ticks through the touch
 market_ticks_before_end = 10
-max_places_per_loop = 4
+max_places_per_loop = 8
 
 [unwind.horizon_ticks]     # baseline time to work a fresh tender
 CRZY = 15
@@ -98,6 +99,7 @@ stale_data_seconds = 3.0
 strict_freeze = true       # pending tender: freeze ALL new orders in that stock and cancel ALL its resting orders
 tick_window = true         # send orders only after re-reading tenders this tick, and not near the next tick boundary
 tick_window_margin = 0.08  # seconds kept clear before the estimated next tick boundary
+tick_boundary_guard = false # also hold orders back near the next tick boundary (slows unwinding on a 250 ms link)
 tick_seconds_prior = 1.0   # initial estimate of seconds per tick (learned live)
 tick_window_max_skip = 2   # if the window stayed shut this many ticks (slow link), send anyway after re-reading tenders
 penalty_per_violation = 100000.0  # used by backtests/sweeps to rank settings

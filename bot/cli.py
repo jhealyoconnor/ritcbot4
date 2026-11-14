@@ -141,8 +141,17 @@ def main(argv=None) -> int:
             try:
                 status = engine.run_once()
             except AuthError as exc:
-                print(f"\nAUTH FAILED: {exc}")
-                return 1
+                if not engine.auth_lost():
+                    print(f"\nAUTH FAILED before any heat: {exc}")
+                    return 1
+                if last_status != "401":
+                    print(f"Server returned 401 (between heats). Retrying login every 2 s on port {port}... "
+                          "Ctrl+C to quit.")
+                last_status = "401"
+                if presses["n"] or (args.once and engine.summaries):
+                    break
+                time.sleep(2.0)
+                continue
             if engine.exit_requested:
                 if not engine.dry and engine.kill == "now":
                     engine._cancel_all("exit")

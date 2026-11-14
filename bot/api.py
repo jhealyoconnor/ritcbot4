@@ -99,7 +99,8 @@ class AdaptiveRateLimiter:
     def on_429(self, wait: float) -> None:
         with self.lock:
             now = self.clock()
-            self.rate = max(self.min_rate, self.rate * self.decrease_factor)
+            if now - self.last_429 > 0.5:          # parallel requests rejected together count once
+                self.rate = max(self.min_rate, self.rate * self.decrease_factor)
             self.blocked_until = max(self.blocked_until, now + wait)
             self.last_429 = now
             self.tokens = 0.0
@@ -186,7 +187,7 @@ class RitClient:
             if resp.status_code == 429:
                 self.stats.record(latency, False)
                 self.stats.rate_limited += 1
-                wait = _retry_after(resp)
+                wait = min(_retry_after(resp), 1.0)
                 self.limiter.on_429(wait)
                 limited += 1
                 if limited > self.max_429:
