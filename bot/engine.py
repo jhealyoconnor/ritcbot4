@@ -29,6 +29,7 @@ from .logs import HeatLogger
 from .marketdata import (Book, SecurityInfo, Tender, parse_book, parse_securities, parse_tender,
                          tick_size_from_decimals)
 from .tracker import OrderTracker, TrackedOrder
+from .txpnl import analyse as tx_analyse, match_tenders
 from .valuation import Evaluation, LiqParams, decide, evaluate_tender, liquidation_value
 
 
@@ -124,6 +125,7 @@ class Engine:
         self.tas_after: Dict[str, Optional[int]] = {t: None for t in self.tickers}
         self.tx_after: Optional[int] = 0          # after=0 returns the full log, then incremental
         self.transactions: List[Dict] = []
+        self.tx_rows: Dict[int, Dict] = {}
         self.unwind_only = False
         self.degraded = False
         self.last_logged_tick = -1
@@ -844,10 +846,14 @@ class Engine:
 
     # =================================================================== aux
     def _aux(self) -> None:
-        if self.loop % int(self.cfg.requests.aux_every) != 0:
+        every = int(self.cfg.requests.aux_every)
+        if self.snap.tick >= self.end_tick() - 8 and not self.tracker.live() \
+                and all(self.pos(t) == 0 for t in self.tickers):
+            every = 2                    # capture the last transactions before the heat closes
+        if self.loop % every != 0:
             return
         calls: List[Tuple[str, Callable]] = [("limits", self.client.limits), ("trader", self.client.trader),
-                                             ("tx", lambda: self.client.transactions(self.tx_after))]
+                                             ("tx", lambda: self.client.transactions(self.tx_after, 1000))]
         for t in self.tickers:
             calls.append((f"tas:{t}", (lambda t=t: self.client.tas(t, self.tas_after[t]))))
         for to in self.tracker.needs_final_fill()[:4]:
@@ -867,7 +873,10 @@ class Engine:
                 if row.get("id") is not None:
                     self.tx_after = max(self.tx_after or 0, int(row["id"]))
             if rows:
-                self.transactions.extend(rows)
+                for row in rows:
+                    if row.get("id") is not None:
+                        self.tx_rows[int(row["id"])] = row
+                self.transactions = [self.tx_rows[i] for i in sorted(self.tx_rows)]
                 self.log.event("transactions", self.snap.tick, rows=rows)
         for t in self.tickers:
             res = r.get(f"tas:{t}")
@@ -1000,6 +1009,25 @@ class Engine:
             "server_fines": self.snap.total_fines,
             "warnings": list(self.warnings),
         }
+        # per-tender P&L from the server's own transaction rows (exact when the log is complete)
+        rep = tx_analyse(self.transactions)
+        match_tenders(rep, [{"id": r.tender.tender_id, "ticker": r.tender.ticker, "signed_qty": r.tender.signed_qty,
+                             "price": r.tender.price} for r in recs if r.final == "ACCEPTED"])
+        ev_by_id = {r.tender.tender_id: r.accept_ev for r in recs}
+        summary["server_tx"] = {
+            "complete": rep.complete, "flat": rep.flat(), "rows": rep.rows, "gaps": rep.gaps,
+            "first_id": rep.first_id, "total_pnl": round(rep.total_pnl, 2), "fees": round(rep.total_fees, 2),
+            "last_balance": rep.last_balance, "unattributed_qty": rep.unattributed_qty, "fines": rep.fines,
+            "tenders": [{"tender_id": l.tender_id, "ticker": l.ticker, "qty": l.signed_qty, "price": l.price,
+                         "predicted_ev": round(ev_by_id[l.tender_id], 2) if ev_by_id.get(l.tender_id) is not None else None,
+                         "realised": round(l.pnl_marked(marks.get(l.ticker)), 2), "fees": round(l.fees, 2),
+                         "avg_unwind": round(l.avg_close, 4) if l.avg_close else None,
+                         "edge_per_share": round(l.edge_per_share, 4) if l.edge_per_share is not None else None,
+                         "remaining": l.remaining, "netted": l.netted_qty,
+                         "ticks": [l.tick, l.last_close_tick]} for l in rep.lots]}
+        trusted = rep.rows > 0 and rep.gaps == 0 and rep.flat() and rep.first_id == 1
+        summary["final_pnl"] = round(rep.total_pnl, 2) if trusted else summary["ledger_pnl"]
+        summary["final_pnl_source"] = "server transactions" if trusted else "bot ledger (transaction log incomplete)"
         lines = [f"===== HEAT {self.heat_no} SUMMARY ({why}) =====",
                  f"Tenders: seen {summary['tenders_seen']}, accepted {summary['accepted']}, declined "
                  f"{summary['declined']}, would-accept {summary['would_accept']}, would-decline "
@@ -1011,6 +1039,13 @@ class Engine:
             lines.append(f"  lot {l['lot']} {l['ticker']} {l['qty']:+,} @ {l['price']}: P&L ${l['pnl']:,.2f} "
                          f"(expected {l['expected_ev']}), avg close {l['avg_close']}, edge/share "
                          f"{l['edge_per_share_vs_tender']}, fees ${l['fees']:,.2f}, remaining {l['remaining']}")
+        lines.append(f"Per tender from SERVER transactions ({rep.rows} rows, "
+                     f"{'complete' if rep.complete else 'INCOMPLETE: first id %s, %s gaps' % (rep.first_id, rep.gaps)}):")
+        for x in summary["server_tx"]["tenders"]:
+            lines.append(f"  #{x['tender_id']} {x['ticker']} {x['qty']:+,.0f} @ {x['price']}: predicted "
+                         f"{x['predicted_ev']}, realised ${x['realised']:,.2f}, fees ${x['fees']:,.2f}, avg unwind "
+                         f"{x['avg_unwind']}, edge/share {x['edge_per_share']}, left {x['remaining']:+,.0f}")
+        lines.append(f"FINAL P&L: ${summary['final_pnl']:,.2f} (source: {summary['final_pnl_source']})")
         lines += [f"P&L: ledger ${summary['ledger_pnl']:,.2f} | server NLV change {summary['server_pnl']}",
                   f"Fees paid (est.): ${summary['fees_paid']:,.2f} | fee on tender observed: {summary['fee_on_tender_observed']}",
                   f"Orders sent {self.orders_sent}, compliance-blocked {summary['blocked_orders']} {summary['blocked_reasons']}",

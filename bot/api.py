@@ -270,8 +270,11 @@ class RitClient:
     def decline_tender(self, tender_id: int) -> Result:
         return self.call("DELETE", f"tenders/{tender_id}")
 
-    def transactions(self, after: Optional[int] = None) -> Result:
-        params: Dict[str, Any] = {"after": after} if after is not None else {"limit": 50}
+    def transactions(self, after: Optional[int] = None, limit: int = 1000) -> Result:
+        # live server: rows with id >= after, but only the latest `limit` (default 20), so ask for plenty
+        params: Dict[str, Any] = {"limit": limit}
+        if after is not None:
+            params["after"] = after
         return self.call("GET", "transactions", params)
 
 

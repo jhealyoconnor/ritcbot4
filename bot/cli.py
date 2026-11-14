@@ -21,6 +21,24 @@ from .logs import HeatLogger
 from .marketdata import parse_book, parse_tender
 
 
+class CtrlC:
+    """Two-step Ctrl+C. First press only warns; a second within `window` seconds flattens and stops;
+    a press while flattening cancels everything and exits now; one more aborts the process."""
+
+    def __init__(self, window: float = 3.0) -> None:
+        self.window, self.last, self.stage = window, None, 0
+
+    def press(self, now: float) -> str:
+        if self.stage >= 1:
+            self.stage += 1
+            return "now" if self.stage == 2 else "abort"
+        if self.last is not None and now - self.last <= self.window:
+            self.stage = 1
+            return "flatten"
+        self.last = now
+        return "warn"
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m bot", description="RITCx Liability Trading bot (DMA REST API)")
     mode = p.add_mutually_exclusive_group()
@@ -110,23 +128,49 @@ def main(argv=None) -> int:
     engine = Engine(client, cfg, mode=mode, logger=logger, stop_dir=os.getcwd())
     use_display = cfg.display.enabled and not args.no_display
 
-    presses = {"n": 0}
+    presses = {"n": 0, "t": 0.0, "armed": False}
+    session = []
+
+    ctrl = CtrlC()
 
     def on_sigint(signum, frame):
-        presses["n"] += 1
-        engine.request_kill("flatten" if presses["n"] == 1 else "now")
-        if presses["n"] >= 3:
+        action = ctrl.press(time.monotonic())
+        if action == "warn":
+            engine.warn("Ctrl+C: press again within 3 s to flatten and stop (ignored otherwise)")
+            print("\nCtrl+C: press again within 3 s to flatten and stop. Nothing changed.")
+        elif action == "flatten":
+            presses["armed"] = True
+            engine.request_kill("flatten")
+            print("\nCtrl+C confirmed: flattening, then stopping. Press again to cancel all orders and exit NOW.")
+        elif action == "now":
+            engine.request_kill("now")
+        else:
             raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, on_sigint)
 
     def heat_end(summary, text):
         print("\n" + text)
+        session.append(summary)
+        total = sum(s.get("final_pnl") or 0 for s in session)
+        print("SESSION: " + " | ".join(f"heat {s['heat']}: ${s.get('final_pnl') or 0:,.0f}" for s in session)
+              + f" | TOTAL ${total:,.0f} over {len(session)} heat(s)")
+        try:
+            root = os.path.dirname(logger.dir)
+            new_file = not os.path.exists(os.path.join(root, "session_totals.csv"))
+            with open(os.path.join(root, "session_totals.csv"), "a") as fh:
+                if new_file:
+                    fh.write("when,log_dir,heat,final_pnl,source,accepted,end_positions,session_total\n")
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{os.path.basename(logger.dir)},{summary['heat']},"
+                         f"{summary.get('final_pnl')},{summary.get('final_pnl_source')},{summary.get('accepted')},"
+                         f"\"{summary.get('end_positions')}\",{total}\n")
+        except OSError:
+            pass
         print(f"Logs: {logger.dir}")
 
     engine.on_heat_end = heat_end
     print(f"{mode.upper()} mode on {base} as {user}. Logs: {logger.dir}")
-    print("Ctrl+C once = flatten safely then exit; twice = cancel all orders and exit now. "
+    print("Ctrl+C: first press only warns; again within 3 s = flatten then exit; once more = cancel all and exit now. "
           "Or create a file named STOP / STOP_NOW in this folder.")
     try:
         engine.startup()
@@ -148,7 +192,7 @@ def main(argv=None) -> int:
                     print(f"Server returned 401 (between heats). Retrying login every 2 s on port {port}... "
                           "Ctrl+C to quit.")
                 last_status = "401"
-                if presses["n"] or (args.once and engine.summaries):
+                if presses["armed"] or (args.once and engine.summaries):
                     break
                 time.sleep(2.0)
                 continue

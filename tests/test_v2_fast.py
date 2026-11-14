@@ -59,3 +59,38 @@ def test_401_between_heats_writes_summary_and_resumes():
     assert eng.auth_lost() is True and len(seen) == 1 and not eng.heat_started
     eng.run_once()                                   # server back: next heat starts
     assert eng.heat_started and eng.heat_no == 2
+
+
+def test_two_step_ctrl_c():
+    from bot.cli import CtrlC
+    c = CtrlC()
+    assert c.press(10.0) == "warn"
+    assert c.press(20.0) == "warn"            # too late: counts as a new first press
+    assert c.press(22.5) == "flatten"
+    assert c.press(23.0) == "now" and c.press(23.1) == "abort"
+
+
+def test_summary_has_per_tender_pnl_from_server_transactions_and_survives_401():
+    from sim.market import live_params
+    m = SimMarket(6, live_params(competitors=0), tenders=[TenderSpec(20, "CRZY", "BUY", 60000, 0.30),
+                                                           TenderSpec(120, "TAME", "SELL", 40000, 0.30)])
+    c = SimClient(m)
+    clock = FakeClock()
+    eng = Engine(c, CFG, mode="sim", clock=clock, parallel=False)
+    eng.startup()
+    while m.tick < 295:
+        for _ in range(2):
+            clock.t += 0.5
+            eng.run_once()
+        m.step()
+    assert all(v == 0 for v in m.accounts[m.bot].positions.values())
+    seen = []
+    eng.on_heat_end = lambda s, t: seen.append((s, t))
+    assert eng.auth_lost() is True                       # server answers 401: heat is closed out
+    s, text = seen[0]
+    tx = s["server_tx"]
+    assert tx["complete"] and tx["flat"] and len(tx["tenders"]) == 2
+    assert {x["tender_id"] for x in tx["tenders"]} == {t["tid"] for t in m.tender_log}
+    assert abs(sum(x["realised"] for x in tx["tenders"]) - m.nlv(m.bot)) < 0.5
+    assert abs(s["final_pnl"] - m.nlv(m.bot)) < 0.5 and s["final_pnl_source"] == "server transactions"
+    assert all(x["predicted_ev"] is not None for x in tx["tenders"]) and "FINAL P&L" in text

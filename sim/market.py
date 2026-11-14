@@ -391,6 +391,11 @@ class SimMarket:
                     if self.tick >= spec.expires:
                         del acc.pending[tid]
 
+    def _txid(self, acc: Account) -> int:
+        """Transaction ids are per trader on the live server (1, 2, 3, ...)."""
+        acc.comp_state["_tx"] = acc.comp_state.get("_tx", 0) + 1
+        return acc.comp_state["_tx"]
+
     def _tlog(self, tid: int, outcome: str) -> None:
         for r in self.tender_log:
             if r["tid"] == tid:
@@ -400,7 +405,7 @@ class SimMarket:
         signed = spec.qty if spec.action == "BUY" else -spec.qty
         acc.positions[spec.ticker] += signed
         acc.cash -= signed * spec.price
-        rec = {"id": next(self.tx_ids), "period": self.period, "tick": self.tick, "ticker": spec.ticker,
+        rec = {"id": self._txid(acc), "period": self.period, "tick": self.tick, "ticker": spec.ticker,
                "type": "TENDER", "price": spec.price, "quantity": signed, "currency": "CAD",
                "cash_flow": -signed * spec.price, "balance": round(acc.cash, 2)}
         acc.tx.append(rec)
@@ -408,7 +413,7 @@ class SimMarket:
             fee = spec.qty * self.p.fee
             acc.cash -= fee
             acc.fees += fee
-            acc.tx.append({"id": next(self.tx_ids), "period": self.period, "tick": self.tick, "ticker": spec.ticker,
+            acc.tx.append({"id": self._txid(acc), "period": self.period, "tick": self.tick, "ticker": spec.ticker,
                            "type": "COMMISSION", "price": self.p.fee, "quantity": spec.qty, "currency": "CAD",
                            "cash_flow": -fee, "balance": round(acc.cash, 2)})
 
@@ -451,10 +456,10 @@ class SimMarket:
             fee = q * self.p.fee
             acc.cash -= fee
             acc.fees += fee
-            acc.tx.append({"id": next(self.tx_ids), "period": self.period, "tick": self.tick, "ticker": o.ticker,
+            acc.tx.append({"id": self._txid(acc), "period": self.period, "tick": self.tick, "ticker": o.ticker,
                            "type": "ORDER", "price": price, "quantity": signed, "currency": "CAD",
                            "cash_flow": -signed * price, "balance": round(acc.cash + fee, 2)})
-            acc.tx.append({"id": next(self.tx_ids), "period": self.period, "tick": self.tick, "ticker": o.ticker,
+            acc.tx.append({"id": self._txid(acc), "period": self.period, "tick": self.tick, "ticker": o.ticker,
                            "type": "COMMISSION", "price": self.p.fee, "quantity": q, "currency": "CAD",
                            "cash_flow": -fee, "balance": round(acc.cash, 2)})
         o.filled += q
