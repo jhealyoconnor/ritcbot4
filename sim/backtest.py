@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 
 from bot.config import load_config
 from bot.engine import Engine
+from bot.logs import HeatLogger
 
 from .client import SimClient
 from .market import SimMarket, SimParams, TenderSpec
@@ -41,12 +42,14 @@ class HeatResult:
 
 def run_heat(seed: int = 0, overrides: Optional[Dict] = None, tenders: Optional[List[TenderSpec]] = None,
              params: Optional[SimParams] = None, loops_per_tick: int = 3, cfg=None,
-             initial_positions: Optional[Dict[str, int]] = None, market: Optional[SimMarket] = None) -> HeatResult:
+             initial_positions: Optional[Dict[str, int]] = None, market: Optional[SimMarket] = None,
+             log_dir: Optional[str] = None) -> HeatResult:
     cfg = cfg or load_config(overrides=overrides)
+    logger = HeatLogger(log_dir, tag=f"sim{seed}") if log_dir else None
     m = market or SimMarket(seed, params, tenders, initial_bot_positions=initial_positions)
     client = SimClient(m)
     clock = FakeClock()
-    eng = Engine(client, cfg, mode="sim", clock=clock, parallel=False)
+    eng = Engine(client, cfg, mode="sim", clock=clock, parallel=False, logger=logger)
     eng.startup()
     m.start_nlv = m.nlv(m.bot)
     while m.status == "ACTIVE":
@@ -55,6 +58,8 @@ def run_heat(seed: int = 0, overrides: Optional[Dict] = None, tenders: Optional[
             eng.run_once()
         m.step()
     eng.run_once()   # sees STOPPED -> heat summary
+    if logger is not None:
+        logger.close()
     acc = m.accounts[m.bot]
     return HeatResult(seed, m.bot_pnl(), list(m.violations), dict(m.end_positions or {}), list(m.tender_log),
                       sum(1 for t in m.tender_log if t["outcome"] == "ACCEPTED"), acc.fees,

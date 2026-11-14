@@ -108,4 +108,4 @@ refresh_seconds = 0.5
 
 [logging]
 dir = "logs"
-book_levels = 10           # levels per side written to the tick log
+book_levels = 20           # levels per side written to the tick log (replay needs depth)
