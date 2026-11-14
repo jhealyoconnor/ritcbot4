@@ -145,8 +145,10 @@ def evaluate_tender(t: Tender, positions: Dict[str, int], bids: List[Level], ask
     if ok:
         net_after = abs(sum(after.values()))
         gross_after = sum(abs(v) for v in after.values())
-        if net_after > net_limit or gross_after > gross_limit:
-            ok, why = False, "would breach limits"
+        if net_after > net_limit:
+            ok, why = False, f"would breach net limit ({net_after:,} > {net_limit:,})"
+        elif gross_after > gross_limit:
+            ok, why = False, f"would breach gross limit ({gross_after:,} > {gross_limit:,})"
     if ok and per_stock_cap and abs(x + d) > net_limit:
         ok, why = False, f"|{t.ticker}| would be {abs(x + d):,} > {net_limit:,} (per-stock cap)"
     if not ok:
