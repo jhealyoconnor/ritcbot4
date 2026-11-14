@@ -22,11 +22,12 @@ from .market import SimError, SimMarket, SimParams
 
 class MockConfig:
     def __init__(self, user="BOT", password="pass", latency=0.0, jitter=0.0, rate_limit=0.0, drop_prob=0.0,
-                 tick_seconds=1.0, seed=0) -> None:
+                 tick_seconds=1.0, seed=0, drop_after_prob=0.0) -> None:
         self.user, self.password = user, password
         self.latency, self.jitter = latency, jitter
         self.rate_limit = rate_limit          # requests/second allowed (0 = unlimited)
-        self.drop_prob = drop_prob
+        self.drop_prob = drop_prob            # drop before the request is processed
+        self.drop_after_prob = drop_after_prob  # process the request, then drop the response
         self.tick_seconds = tick_seconds
         self.rng = random.Random(seed)
 
@@ -56,6 +57,7 @@ def make_handler(market: SimMarket, cfg: MockConfig, stats: dict):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        disable_nagle_algorithm = True     # avoid 40 ms delayed-ACK stalls on keep-alive connections
 
         def log_message(self, *a):  # quiet
             pass
@@ -136,6 +138,14 @@ def make_handler(market: SimMarket, cfg: MockConfig, stats: dict):
                 return self._send(exc.status, {"code": "ERROR", "message": exc.message})
             except (KeyError, ValueError) as exc:
                 return self._send(400, {"code": "BAD_REQUEST", "message": str(exc)})
+            if cfg.drop_after_prob and cfg.rng.random() < cfg.drop_after_prob:
+                stats["dropped_after"] = stats.get("dropped_after", 0) + 1
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(2)
+                except OSError:
+                    pass
+                return
             return self._send(200, body)
 
         def do_GET(self):
@@ -195,6 +205,7 @@ def main(argv=None) -> int:
     ap.add_argument("--jitter", type=float, default=0.05)
     ap.add_argument("--rate-limit", type=float, default=25.0)
     ap.add_argument("--drop-prob", type=float, default=0.0)
+    ap.add_argument("--drop-after-prob", type=float, default=0.0)
     ap.add_argument("--user", default="BOT")
     ap.add_argument("--password", default="pass")
     ap.add_argument("--book-keys", default="bids", choices=["bids", "bid"])
@@ -202,7 +213,7 @@ def main(argv=None) -> int:
     params = SimParams(book_keys=args.book_keys)
     market = SimMarket(args.seed, params, bot_id=args.user)
     cfg = MockConfig(args.user, args.password, args.latency, args.jitter, args.rate_limit, args.drop_prob,
-                     args.tick_seconds, args.seed)
+                     args.tick_seconds, args.seed, args.drop_after_prob)
     srv = MockServer(market, cfg, args.port).start()
     print(f"Mock RIT DMA server on http://localhost:{srv.port}/v1 (user {args.user} / {args.password}); "
           f"{params.ticks} ticks x {args.tick_seconds}s. Ctrl+C to stop.")

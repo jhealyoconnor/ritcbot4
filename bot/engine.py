@@ -90,6 +90,15 @@ class Engine:
         self.heat_no = 0
         self.summaries: List[Dict] = []
         self.on_heat_end: Optional[Callable[[Dict, str], None]] = None
+        # tick timing for the safe send window (new tenders appear at tick boundaries)
+        self.tick_len = float(cfg.risk.tick_seconds_prior)
+        self._tick_seen: Optional[int] = None
+        self._tick_first_seen = 0.0
+        self._last_same_seen: Optional[float] = None
+        self.tick_boundary_lo = 0.0
+        self.tenders_verified_tick = -1
+        self.deferred_sends = 0
+        self._window_closed_since: Optional[int] = None
         self._reset_heat()
 
     # ================================================================ setup
@@ -309,6 +318,7 @@ class Engine:
             return "ERROR"
         prev_tick, prev_status, prev_period = self.snap.tick, self.snap.status, self.snap.period
         self._apply_case(r["case"].data)
+        self._track_tick(self.clock())
         s = self.snap
         if s.status != "ACTIVE":
             if s.status == "STOPPED" and self.heat_started:
@@ -346,6 +356,47 @@ class Engine:
             self.exit_requested = True
         return "ACTIVE"
 
+    def _latency(self) -> float:
+        stats = getattr(self.client, "stats", None)
+        return float(stats.latency_ewma or 0.0) if stats is not None else 0.0
+
+    def _track_tick(self, now: float) -> None:
+        t = self.snap.tick
+        lat = self._latency()
+        if self._tick_seen is None or t != self._tick_seen:
+            if self._tick_seen is not None and t == self._tick_seen + 1 and self._tick_first_seen:
+                dt = now - self._tick_first_seen
+                if 0.005 < dt < 10:
+                    self.tick_len = 0.8 * self.tick_len + 0.2 * dt
+            if self._last_same_seen is not None and self._tick_seen is not None and t == self._tick_seen + 1:
+                self.tick_boundary_lo = self._last_same_seen - lat       # earliest the boundary can have been
+            else:
+                self.tick_boundary_lo = now - lat - float(self.cfg.requests.loop_period) - lat
+            self._tick_seen = t
+            self._tick_first_seen = now
+            self.tenders_verified_tick = -1
+        self._last_same_seen = now
+
+    def send_window_open(self, purpose: str = "") -> bool:
+        """Orders go out only (a) after tenders were re-read in the current tick and (b) early enough
+        in the tick that they reach the server before the next tick boundary, when new tenders can
+        appear. Shrinks the unavoidable 'tender arrived but not yet seen' gap to ~zero.
+        (b) never blocks the end-of-heat flatten, and relaxes if it has blocked for
+        tick_window_max_skip ticks in a row (slow connection), so the bot can always unwind."""
+        if not bool(self.cfg.risk.tick_window):
+            return True
+        if self.tenders_verified_tick != self.snap.tick:
+            return False
+        now = self.clock()
+        if now + 0.5 * self._latency() + float(self.cfg.risk.tick_window_margin) < self.tick_boundary_lo + self.tick_len:
+            self._window_closed_since = None
+            return True
+        if purpose == "flatten":
+            return True
+        if self._window_closed_since is None:
+            self._window_closed_since = self.snap.tick
+        return self.snap.tick - self._window_closed_since >= int(self.cfg.risk.tick_window_max_skip)
+
     def _error(self, msg: str) -> None:
         self.err_count += 1
         self.warn(msg)
@@ -381,11 +432,21 @@ class Engine:
             if (only is not None or self.pos(t) != 0 or t in pending_t or t not in self.snap.books
                     or self.loop % int(self.cfg.requests.idle_book_every) == 0 or self.tracker.live(t)):
                 need.append(t)
-        if not need:
+        may_send = only is None and (any(self.pos(t) != 0 for t in self.tickers) or bool(self.tracker.live()))
+        if not need and not may_send:
             return
         lv = int(self.cfg.requests.book_levels)
-        r = self._par([(t, (lambda t=t: self.client.book(t, lv))) for t in need])
+        calls = [(t, (lambda t=t: self.client.book(t, lv))) for t in need]
+        if may_send:
+            calls.append(("__tenders__", self.client.tenders))
+        r = self._par(calls)
         for t, res in r.items():
+            if t == "__tenders__":
+                if not isinstance(res, Exception):
+                    self.snap.tenders = [parse_tender(x, self.tickers, str(self.cfg.tender.action_fallback))
+                                         for x in (res.data or [])]
+                    self.tenders_verified_tick = self.snap.tick
+                continue
             if isinstance(res, Exception):
                 self.warn(f"book {t}: {res}")
             else:
@@ -633,6 +694,9 @@ class Engine:
 
     # ================================================================ orders
     def send(self, req: OrderRequest) -> Optional[TrackedOrder]:
+        if not self.send_window_open(req.purpose):
+            self.deferred_sends += 1
+            return None
         ok, reason = gate_mod.check(req, self.gate_context())
         if not ok:
             self.blocked[reason.split(":")[0]] += 1
@@ -751,9 +815,8 @@ class Engine:
             if plan.cancels or plan.cancel_foreign:
                 self._cancel_orders(plan.cancels, plan.cancel_foreign, f"unwind {plan.phase}")
             for req in plan.places[: int(uc.max_places_per_loop)]:
-                self.send(req)
-            if plan.scheduled:
-                self.last_schedule_tick[t] = s.tick
+                if self.send(req) is not None and req.purpose == "schedule":
+                    self.last_schedule_tick[t] = s.tick
 
     # =================================================================== aux
     def _aux(self) -> None:
@@ -889,7 +952,7 @@ class Engine:
             "ledger_pnl": round(self.ledger.total_pnl(marks), 2),
             "server_pnl": round(self.heat_pnl(), 2) if self.heat_pnl() is not None else None,
             "fees_paid": round(self.ledger.fees_paid(), 2),
-            "orders_sent": self.orders_sent,
+            "orders_sent": self.orders_sent, "sends_deferred_to_next_tick": self.deferred_sends,
             "blocked_orders": sum(self.blocked.values()), "blocked_reasons": dict(self.blocked),
             "end_positions": self.positions(),
             "max_net": self.max_net, "max_gross": self.max_gross,

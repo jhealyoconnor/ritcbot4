@@ -96,6 +96,10 @@ max_loss = 50000.0         # heat P&L below -max_loss: unwind-only, decline all 
 max_consecutive_errors = 5 # then decline new tenders until reads succeed again
 stale_data_seconds = 3.0
 strict_freeze = true       # pending tender: freeze ALL new orders in that stock and cancel ALL its resting orders
+tick_window = true         # send orders only after re-reading tenders this tick, and not near the next tick boundary
+tick_window_margin = 0.08  # seconds kept clear before the estimated next tick boundary
+tick_seconds_prior = 1.0   # initial estimate of seconds per tick (learned live)
+tick_window_max_skip = 2   # if the window stayed shut this many ticks (slow link), send anyway after re-reading tenders
 penalty_per_violation = 100000.0  # used by backtests/sweeps to rank settings
 
 [display]
