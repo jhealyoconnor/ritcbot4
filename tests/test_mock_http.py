@@ -21,7 +21,10 @@ def run_live_heat(seed, tick_seconds=0.1, latency=0.004, jitter=0.002, rate_limi
     ov = {"requests.loop_period": 0.0, "requests.initial_rate": 300.0, "requests.max_rate": 600.0,
           "requests.min_rate": 20.0, "connection.backoff_base": 0.01, "connection.read_timeout": 1.0,
           "risk.stale_data_seconds": 1.0, "risk.tick_seconds_prior": tick_seconds,
-          "risk.tick_window_margin": 0.15 * tick_seconds}
+          "risk.tick_window_margin": 0.15 * tick_seconds,
+          # time is compressed 10x here, so a burst of orders spans a whole tick; the tick-boundary
+          # guard (optional in live use) keeps this plumbing test deterministic
+          "risk.tick_boundary_guard": True}
     ov.update(overrides or {})
     cfg = load_config(overrides=ov)
     client = RitClient(f"http://127.0.0.1:{srv.port}/v1", "BOT", "pass", cfg.connection, cfg.requests)
