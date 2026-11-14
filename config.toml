@@ -1,0 +1,107 @@
+# ritcbot4 configuration: every threshold the bot uses lives in this file.
+# Override any value for one run from the command line, e.g.
+#   python -m bot --set tender.min_ev_total=150 --set unwind.passive=false
+# Server-published values (limits, max order size, fee, tick size) are read live;
+# where both exist the STRICTER of server and this file is used.
+
+[connection]
+host = "flserver.rotman.utoronto.ca"   # overridden by --host or RIT_HOST
+connect_timeout = 2.0                  # seconds
+read_timeout = 3.0                     # seconds
+max_get_retries = 3                    # retries for reads / cancels / declines on dropped connections
+backoff_base = 0.2                     # seconds, doubles each retry
+max_429_retries = 20
+workers = 4                            # parallel read threads sharing one keep-alive Session
+
+[requests]
+initial_rate = 20.0       # requests/second budget at start; adapts from 429 responses
+min_rate = 3.0
+max_rate = 40.0
+increase_per_sec = 0.5    # additive increase per second without a 429
+decrease_factor = 0.7     # multiplicative decrease on each 429
+loop_period = 0.25        # target seconds per main loop (server tick is ~1 s)
+book_levels = 30          # levels requested per side of each book
+idle_book_every = 4       # books for stocks with no position/tender: every N loops
+aux_every = 8             # limits / trader NLV / transactions / time&sales: every N loops
+
+[case]
+tickers = ["CRZY", "TAME"]
+net_limit = 100000         # brief; the stricter of /limits and this wins
+gross_limit = 250000
+per_stock_cap = true       # keep each |position| <= net_limit so no unwind order can ever breach net
+default_ticks_per_period = 300
+heat_end_tick = 0          # 0 = use ticks_per_period from /case
+
+[case.max_order]           # per-order caps (brief); the stricter of server max_trade_size and this wins
+CRZY = 25000
+TAME = 10000
+
+[fees]
+per_share = 0.02           # fee on every market trade (server trading_fee used if larger)
+on_tender = true           # assume the fee also applies to the tender trade (logged so you can confirm)
+
+[tender]
+min_ev_per_share = 0.005   # accept only if expected P&L per share >= this ...
+min_ev_total = 150.0       # ... and expected P&L in $ >= this
+marginal_ratio = 0.5       # EV between ratio*threshold and threshold: wait, re-evaluate every tick
+decide_margin_ticks = 3    # explicit decline at (expires - this) if still marginal
+anon_only = false          # count only ANON orders when walking the book
+action_fallback = "trader" # meaning of the tender 'action' field when the caption can't be parsed
+risk_lambda = 0.3          # inventory-risk buffer: lambda * sigma * sqrt(unwind_ticks / 3) per share
+slippage_ticks = 1.0       # expected slippage (in price ticks) on shares worked as the book refills
+dump_penalty = 0.10        # $/share haircut beyond visible depth if forced to dump at the end
+competitors = 0.0          # assumed other traders unwinding the same tender (refill is shared)
+auto_competitors = true    # raise the competitor estimate when depth drains after tenders
+
+[tender.ref_depth]         # shares used for the refill reference price (VWAP of the top N shares)
+CRZY = 20000
+TAME = 10000
+
+[tender.refill_prior]      # prior: shares/tick that come back near the touch (updated live)
+CRZY = 3000
+TAME = 1500
+
+[tender.vol_prior]         # prior: $ std of the mid per tick (updated live)
+CRZY = 0.04
+TAME = 0.02
+
+[unwind]
+sweep = true               # on accept, immediately take every visible share priced better than break-even
+min_edge = 0.0             # sweep floor = break-even (tender +/- both fees) +/- this
+min_horizon_ticks = 4
+max_horizon_ticks = 60
+vol_urgency = 1.0          # horizon scaled by (vol_prior / vol_measured) ^ this
+depth_fraction = 0.6       # a child order takes at most this share of visible depth at its price
+slip_ticks = 1             # schedule orders priced this many ticks through the touch
+min_child = 100            # never send orders smaller than this (except the final clean-up)
+passive = true             # also rest one limit order inside the spread while there is time
+passive_fraction = 0.25    # passive order size as a fraction of the position
+passive_max_age_ticks = 3
+stale_ticks = 2            # cancel unfilled marketable remnants after this many ticks
+escalate_ticks_before_end = 30
+escalate_slip_ticks = 5    # in the escalation window, price this many ticks through the touch
+market_ticks_before_end = 10
+max_places_per_loop = 4
+
+[unwind.horizon_ticks]     # baseline time to work a fresh tender
+CRZY = 15
+TAME = 25
+
+[unwind.max_slip]          # normal phase: never sell below (buy above) the reference mid by more than this
+CRZY = 0.08
+TAME = 0.05
+
+[risk]
+max_loss = 50000.0         # heat P&L below -max_loss: unwind-only, decline all new tenders
+max_consecutive_errors = 5 # then decline new tenders until reads succeed again
+stale_data_seconds = 3.0
+strict_freeze = true       # pending tender: freeze ALL new orders in that stock and cancel ALL its resting orders
+penalty_per_violation = 100000.0  # used by backtests/sweeps to rank settings
+
+[display]
+enabled = true
+refresh_seconds = 0.5
+
+[logging]
+dir = "logs"
+book_levels = 10           # levels per side written to the tick log
