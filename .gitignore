@@ -1,0 +1,21 @@
+# Secrets: never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Run output
+logs/
+STOP
+STOP_NOW
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.vscode/
