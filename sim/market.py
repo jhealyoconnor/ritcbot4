@@ -41,6 +41,24 @@ class TickerParams:
     flow_min: int = 300
     flow_max: int = 3000
     perm_impact: float = 0.002   # $ permanent move per 10k shares of net aggressive volume
+    # "sparse" model, calibrated to the live practice logs: limit orders arrive at random distances
+    # from the fundamental, live for a while and are hit by random market flow. Gives wide, gappy
+    # books (median spread ~10c, ~25k within 10c of the touch, ~150k over ~17 levels per side).
+    model: str = "ladder"        # "ladder" (v1 tests) or "sparse" (live-like)
+    arrivals: float = 2.4        # new limit orders per side per tick
+    offset_mean: float = 0.22    # mean distance of a new order from the fundamental ($)
+    near_frac: float = 0.0       # share of new orders placed close to the fundamental ...
+    near_mean: float = 0.04      # ... at this mean distance
+    size_median: int = 5500      # lognormal order size
+    size_sigma: float = 1.0
+    size_cap: int = 25000
+    cancel_p: float = 0.07       # chance per tick that a resting order is cancelled
+    mflow_rate: float = 3.5      # market orders per tick
+    mflow_min: int = 500
+    mflow_max: int = 6000
+    burst_p: float = 0.0         # chance per tick of one large market order (other traders' blocks) ...
+    burst_min: int = 8000        # ... which causes the short-lived price swings seen live
+    burst_max: int = 25000
 
 
 @dataclass
@@ -56,11 +74,39 @@ class SimParams:
     book_keys: str = "bids"      # "bids" (bids/asks) or "bid" (bid/ask, as in the swagger spec)
     tender_ticker_field: bool = True
     tender_action_perspective: str = "trader"
+    teammates: int = 0           # other accounts (MATE1..) that receive the same tenders; driven by real engines
+    competitor_min_edge: float = 0.03
+    tender_mode: str = "default" # "default" (v1 tests) or "live" (5 windows, 65-75k, edge 0-45c off the book mid)
+    tx_default_limit: int = 50   # the live server returns only the latest 20 rows unless 'limit' is passed
     tickers: Dict[str, TickerParams] = field(default_factory=lambda: {
         "CRZY": TickerParams(10.00, 0.035, 25000),
         "TAME": TickerParams(25.00, 0.020, 10000, level_qty=2000, refill_per_level=400, flow_rate=1.2,
                              flow_max=2000),
     })
+
+
+def live_params(competitors: int = 2, teammates: int = 0, sigma: float = 0.055) -> "SimParams":
+    """Market calibrated to the live practice heats (see README, 'Simulator calibration')."""
+    p = SimParams(competitors=competitors, teammates=teammates, tender_fee=False, tender_mode="live",
+                  tx_default_limit=20, competitor_accept_prob=0.75, competitor_min_edge=0.06)
+    common = dict(model="sparse", near_frac=0.38, near_mean=0.03, offset_mean=0.28, arrivals=2.8, burst_p=0.20)
+    p.tickers = {
+        "CRZY": TickerParams(10.00, sigma, 25000, size_cap=25000, **common),
+        "TAME": TickerParams(25.00, sigma, 10000, size_cap=20000, size_median=5200, **common),
+    }
+    return p
+
+
+LIVE_TENDER_WINDOWS = [(24, 30), (77, 87), (137, 142), (201, 212), (260, 269)]
+
+
+def live_tenders(rng: random.Random) -> List["TenderSpec"]:
+    """Tender pattern seen live: one per window, 65-75k shares, 0-45c better than the mid."""
+    out = []
+    for lo, hi in LIVE_TENDER_WINDOWS:
+        out.append(TenderSpec(rng.randint(lo, hi), rng.choice(["CRZY", "TAME"]), rng.choice(["BUY", "SELL"]),
+                              rng.randrange(65000, 75001, 1000), round(rng.triangular(0.0, 0.45, 0.15), 3)))
+    return out
 
 
 @dataclass
@@ -158,10 +204,18 @@ class SimMarket:
         for i in range(self.p.competitors):
             cid = f"COMP{i + 1}"
             self.accounts[cid] = Account(cid, {t: 0 for t in self.tickers})
+        for i in range(self.p.teammates):
+            mid_ = f"MATE{i + 1}"
+            self.accounts[mid_] = Account(mid_, {t: 0 for t in self.tickers})
         self.accounts["ANON"] = Account("ANON", {t: 0 for t in self.tickers})
         self.level_targets = {t: [max(200, int(self.rng.gauss(tp.level_qty, tp.level_qty * 0.4)))
                                   for _ in range(tp.levels)] for t, tp in self.p.tickers.items()}
-        specs = tenders if tenders is not None else default_tenders(self.rng, self.p.ticks, self.p.n_tenders)
+        if tenders is not None:
+            specs = tenders
+        elif self.p.tender_mode == "live":
+            specs = live_tenders(self.rng)
+        else:
+            specs = default_tenders(self.rng, self.p.ticks, self.p.n_tenders)
         self.tender_specs = sorted((copy.copy(s) for s in specs), key=lambda s: s.tick)
         self.tender_ids = itertools.count(101)
         self.violations: List[Dict] = []
@@ -172,8 +226,12 @@ class SimMarket:
         self.max_net = 0
         self.max_gross = 0
         for t in self.tickers:
-            for _ in range(8):
-                self._anon_replenish(t)
+            if self.p.tickers[t].model == "sparse":
+                for _ in range(40):
+                    self._sparse_step(t, flow=False)
+            else:
+                for _ in range(8):
+                    self._anon_replenish(t)
 
     # ============================================================ dynamics
     def step(self) -> None:
@@ -185,6 +243,10 @@ class SimMarket:
                 tp = self.p.tickers[t]
                 imp = tp.perm_impact * self.aggr_volume[t] / 10000.0
                 self.aggr_volume[t] = 0.0
+                if tp.model == "sparse":
+                    self.F[t] = max(0.5, self.F[t] + self.rng.gauss(0, tp.sigma))
+                    self._sparse_step(t)
+                    continue
                 self.F[t] = max(0.5, self.F[t] + self.rng.gauss(0, tp.sigma) + imp)
                 self._anon_pull(t)
                 self._anon_replenish(t)
@@ -193,6 +255,43 @@ class SimMarket:
             self._tenders_arrive_and_expire()
             if self.tick >= self.p.ticks:
                 self._end()
+
+    def _sparse_step(self, t: str, flow: bool = True) -> None:
+        """Live-like book: random cancels, orders that the fundamental has moved through are
+        pulled, new limit orders arrive at random distances, then random market orders trade."""
+        tp = self.p.tickers[t]
+        f = self.F[t]
+        for o in list(self.bids[t]):
+            if o.trader == "ANON" and (o.price >= f or self.rng.random() < tp.cancel_p):
+                self._remove(o, "CANCELLED")
+        for o in list(self.asks[t]):
+            if o.trader == "ANON" and (o.price <= f or self.rng.random() < tp.cancel_p):
+                self._remove(o, "CANCELLED")
+        mu = math.log(tp.size_median)
+        for side in ("BUY", "SELL"):
+            for _ in range(self._poisson(tp.arrivals)):
+                near = tp.near_frac > 0 and self.rng.random() < tp.near_frac
+                off = 0.01 + self.rng.expovariate(1.0 / (tp.near_mean if near else tp.offset_mean))
+                price = round_tick(f - off if side == "BUY" else f + off)
+                if price <= 0.01:
+                    continue
+                size = int(min(tp.size_cap, max(100, self.rng.lognormvariate(mu, tp.size_sigma))) // 100 * 100) or 100
+                self._match(SOrder(next(self.ids), "ANON", t, side, "LIMIT", size, price, self.tick))
+        if flow:
+            for _ in range(self._poisson(tp.mflow_rate)):
+                q = self.rng.randint(tp.mflow_min, tp.mflow_max)
+                self._match(SOrder(next(self.ids), "ANON", t, self.rng.choice(["BUY", "SELL"]), "MARKET", q, None,
+                                   self.tick))
+            if tp.burst_p > 0 and self.rng.random() < tp.burst_p:
+                q = self.rng.randint(tp.burst_min, tp.burst_max)
+                self._match(SOrder(next(self.ids), "ANON", t, self.rng.choice(["BUY", "SELL"]), "MARKET", q, None,
+                                   self.tick))
+
+    def book_mid(self, t: str) -> float:
+        b, a = self.bids[t], self.asks[t]
+        if b and a:
+            return (b[0].price + a[0].price) / 2.0
+        return self.F[t]
 
     def _anon_pull(self, t: str) -> None:
         tp = self.p.tickers[t]
@@ -248,7 +347,7 @@ class SimMarket:
             for tid, spec in list(acc.pending.items()):
                 d = st.setdefault(("delay", tid), self.rng.randint(1, 6))
                 if self.tick - spec.tick >= d:
-                    if self.rng.random() < self.p.competitor_accept_prob and spec.discount > 0.03:
+                    if self.rng.random() < self.p.competitor_accept_prob and spec.discount > self.p.competitor_min_edge:
                         self._apply_tender(acc, spec)
                     del acc.pending[tid]
             for t in self.tickers:
@@ -265,7 +364,7 @@ class SimMarket:
         for spec in self.tender_specs:
             if spec.tick == self.tick and spec.tid == 0:
                 spec.tid = next(self.tender_ids)
-                mid = self.F[spec.ticker]
+                mid = self.book_mid(spec.ticker) if self.p.tender_mode == "live" else self.F[spec.ticker]
                 spec.price = round_tick(mid - spec.discount if spec.action == "BUY" else mid + spec.discount)
                 spec.expires = self.tick + 30
                 inst = "SELL" if spec.action == "BUY" else "BUY"
@@ -286,6 +385,11 @@ class SimMarket:
                 del bot.pending[tid]
                 self._tlog(tid, "LAPSED")
                 self._violate("lapsed", tender_id=tid)
+        for acc in self.accounts.values():
+            if acc.tid.startswith("MATE"):
+                for tid, spec in list(acc.pending.items()):
+                    if self.tick >= spec.expires:
+                        del acc.pending[tid]
 
     def _tlog(self, tid: int, outcome: str) -> None:
         for r in self.tender_log:
@@ -298,7 +402,7 @@ class SimMarket:
         acc.cash -= signed * spec.price
         rec = {"id": next(self.tx_ids), "period": self.period, "tick": self.tick, "ticker": spec.ticker,
                "type": "TENDER", "price": spec.price, "quantity": signed, "currency": "CAD",
-               "cash_flow": -signed * spec.price}
+               "cash_flow": -signed * spec.price, "balance": round(acc.cash, 2)}
         acc.tx.append(rec)
         if self.p.tender_fee:
             fee = spec.qty * self.p.fee
@@ -306,7 +410,7 @@ class SimMarket:
             acc.fees += fee
             acc.tx.append({"id": next(self.tx_ids), "period": self.period, "tick": self.tick, "ticker": spec.ticker,
                            "type": "COMMISSION", "price": self.p.fee, "quantity": spec.qty, "currency": "CAD",
-                           "cash_flow": -fee})
+                           "cash_flow": -fee, "balance": round(acc.cash, 2)})
 
     # ========================================================== matching
     def _rest(self, o: SOrder) -> None:
@@ -349,10 +453,10 @@ class SimMarket:
             acc.fees += fee
             acc.tx.append({"id": next(self.tx_ids), "period": self.period, "tick": self.tick, "ticker": o.ticker,
                            "type": "ORDER", "price": price, "quantity": signed, "currency": "CAD",
-                           "cash_flow": -signed * price})
+                           "cash_flow": -signed * price, "balance": round(acc.cash + fee, 2)})
             acc.tx.append({"id": next(self.tx_ids), "period": self.period, "tick": self.tick, "ticker": o.ticker,
                            "type": "COMMISSION", "price": self.p.fee, "quantity": q, "currency": "CAD",
-                           "cash_flow": -fee})
+                           "cash_flow": -fee, "balance": round(acc.cash, 2)})
         o.filled += q
         o.cash += q * price
         if acc.tid == self.bot:
@@ -468,12 +572,9 @@ class SimMarket:
                 return {"bid": bids, "ask": asks}
             return {"bids": bids, "asks": asks}
 
-    def api_tas(self, ticker: str, after: Optional[int] = None, limit: int = 50) -> List[Dict]:
+    def api_tas(self, ticker: str, after: Optional[int] = None, limit: Optional[int] = None) -> List[Dict]:
         with self.lock:
-            rows = self.tas.get(ticker, [])
-            if after is not None:
-                return [r for r in rows if r["id"] > int(after)]
-            return rows[-int(limit):]
+            return self._window(self.tas.get(ticker, []), after, limit)
 
     def api_orders(self, tid: str, status: str = "OPEN") -> List[Dict]:
         with self.lock:
@@ -589,9 +690,17 @@ class SimMarket:
                 self._tlog(spec.tid, "DECLINED")
             return {"success": True}
 
-    def api_transactions(self, tid: str, after: Optional[int] = None, limit: int = 50) -> List[Dict]:
-        with self.lock:
-            rows = self._acc(tid).tx
+    def _window(self, rows: List[Dict], after, limit) -> List[Dict]:
+        """v1 behaviour: 'after' is exclusive and unlimited. Live behaviour (seen in the practice
+        logs): rows with id >= after, only the latest `limit` (default 20), newest first."""
+        if self.p.tender_mode != "live":
             if after is not None:
                 return [r for r in rows if r["id"] > int(after)]
-            return rows[-int(limit):]
+            return rows[-int(limit if limit is not None else self.p.tx_default_limit):]
+        out = [r for r in rows if after is None or r["id"] >= int(after)]
+        out = out[-int(limit if limit is not None else self.p.tx_default_limit):]
+        return list(reversed(out))
+
+    def api_transactions(self, tid: str, after: Optional[int] = None, limit: Optional[int] = None) -> List[Dict]:
+        with self.lock:
+            return self._window(self._acc(tid).tx, after, limit)
