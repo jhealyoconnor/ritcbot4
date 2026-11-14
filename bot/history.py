@@ -39,6 +39,9 @@ class TickerHistory:
         self.diffs: Deque[float] = deque(maxlen=window)
         self.refills: Deque[float] = deque(maxlen=window)
         self.last_depth: Optional[Tuple[int, int, int]] = None
+        self.base_bid: Optional[float] = None
+        self.base_ask: Optional[float] = None
+        self.own_side: Dict[Tuple[int, str], float] = {}
         self.ewma_mid: Optional[float] = None
         self.volume: Dict[int, float] = {}       # tick -> market volume (time & sales)
         self.own: Dict[int, float] = {}          # tick -> our filled volume
@@ -66,10 +69,14 @@ class TickerHistory:
                 t_prev, bd0, ad0 = self.last_depth
                 gap = max(1, tick - t_prev)
                 if gap <= 5:
-                    own = self.own.get(tick, 0.0) + self.own.get(t_prev, 0.0)
-                    vol = self.volume.get(tick, 0.0)
-                    inc = (max(0, bd - bd0) + max(0, ad - ad0) + max(0.0, vol - own)) / 2.0 / gap
-                    self.refills.append(inc)
+                    # refill is only observable when the side is below its normal depth:
+                    # arrivals = depth change + what we took from that side meanwhile
+                    for now, prev, base, side in ((bd, bd0, self.base_bid, "bid"), (ad, ad0, self.base_ask, "ask")):
+                        if base and prev < 0.8 * base:
+                            took = sum(self.own_side.get((t, side), 0.0) for t in range(t_prev + 1, tick + 1))
+                            self.refills.append(max(0.0, now - prev + took) / gap)
+            self.base_bid = bd if self.base_bid is None else max(0.97 * self.base_bid, 0.9 * self.base_bid + 0.1 * bd)
+            self.base_ask = ad if self.base_ask is None else max(0.97 * self.base_ask, 0.9 * self.base_ask + 0.1 * ad)
             self.last_depth = (tick, bd, ad)
             self.last_tick = tick
 
@@ -86,7 +93,7 @@ class TickerHistory:
         if n == 0:
             return self.refill_prior
         m = sum(self.refills) / n
-        w = self.prior_weight
+        w = self.prior_weight / 2.0
         return (n * m + w * self.refill_prior) / (n + w)
 
     # ------------------------------------------------------------- volume
@@ -95,8 +102,11 @@ class TickerHistory:
             t = int(tr.get("tick", 0))
             self.volume[t] = self.volume.get(t, 0.0) + float(tr.get("quantity", 0) or 0)
 
-    def on_own_fill(self, tick: int, qty: float) -> None:
+    def on_own_fill(self, tick: int, qty: float, action: str = "") -> None:
         self.own[tick] = self.own.get(tick, 0.0) + qty
+        if action:
+            side = "bid" if action == "SELL" else "ask"     # a sell takes bids
+            self.own_side[(tick, side)] = self.own_side.get((tick, side), 0.0) + qty
 
     def base_volume(self, tick: int, lookback: int = 20) -> float:
         ticks = [t for t in range(tick - lookback, tick)]

@@ -290,7 +290,7 @@ class Engine:
         signed = dq if to.action == "BUY" else -dq
         fee = dq * self.fee(to.ticker)
         self.ledger.on_fill(to.ticker, signed, dc, fee)
-        self.history[to.ticker].on_own_fill(self.snap.tick, dq)
+        self.history[to.ticker].on_own_fill(self.snap.tick, dq, to.action)
         self.log.event("fill", self.snap.tick, ticker=to.ticker, action=to.action, qty=dq,
                        price=round(dc / dq, 4) if dq else None, order_id=to.order_id, purpose=to.purpose,
                        tender_ids=list(to.tender_ids))
