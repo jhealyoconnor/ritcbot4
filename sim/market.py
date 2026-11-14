@@ -12,6 +12,7 @@ All API methods return the same JSON shapes as the RIT DMA REST API.
 """
 from __future__ import annotations
 
+import copy
 import itertools
 import math
 import random
@@ -161,7 +162,7 @@ class SimMarket:
         self.level_targets = {t: [max(200, int(self.rng.gauss(tp.level_qty, tp.level_qty * 0.4)))
                                   for _ in range(tp.levels)] for t, tp in self.p.tickers.items()}
         specs = tenders if tenders is not None else default_tenders(self.rng, self.p.ticks, self.p.n_tenders)
-        self.tender_specs = sorted(specs, key=lambda s: s.tick)
+        self.tender_specs = sorted((copy.copy(s) for s in specs), key=lambda s: s.tick)
         self.tender_ids = itertools.count(101)
         self.violations: List[Dict] = []
         self.tender_log: List[Dict] = []        # what happened to each tender for the bot

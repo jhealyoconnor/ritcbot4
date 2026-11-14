@@ -113,7 +113,7 @@ class Engine:
         self.heat_started = False
         self.start_nlv: Optional[float] = None
         self.tas_after: Dict[str, Optional[int]] = {t: None for t in self.tickers}
-        self.tx_after: Optional[int] = None
+        self.tx_after: Optional[int] = 0          # after=0 returns the full log, then incremental
         self.transactions: List[Dict] = []
         self.unwind_only = False
         self.degraded = False
@@ -779,10 +779,9 @@ class Engine:
             for row in rows:
                 if row.get("id") is not None:
                     self.tx_after = max(self.tx_after or 0, int(row["id"]))
-            new = [row for row in rows if row not in self.transactions]
-            if new:
-                self.transactions.extend(new)
-                self.log.event("transactions", self.snap.tick, rows=new)
+            if rows:
+                self.transactions.extend(rows)
+                self.log.event("transactions", self.snap.tick, rows=rows)
         for t in self.tickers:
             res = r.get(f"tas:{t}")
             if res is not None and not isinstance(res, Exception):
@@ -799,29 +798,25 @@ class Engine:
                     self._fill(to, dq, dc)
 
     def fee_on_tender_observed(self) -> str:
-        """Best reading of the server's own transaction log: is the fee charged on tender trades?"""
-        tender_rows = [r for r in self.transactions if str(r.get("type")).upper() == "TENDER"]
+        """Best reading of the server's own transaction log: is the fee charged on tender trades?
+        Compares commission booked at each tender's tick with what that tick's order fills explain."""
+        rows = self.transactions
+        tender_rows = [r for r in rows if str(r.get("type")).upper() == "TENDER"]
         if not tender_rows:
             return "unknown (no tender transactions seen)"
+        if not any(str(r.get("type")).upper() == "COMMISSION" for r in rows):
+            return "unknown (server log shows no COMMISSION rows; compare NLV change instead)"
         verdicts = []
         for tr in tender_rows:
-            tick = tr.get("tick")
-            comm = [r for r in self.transactions if str(r.get("type")).upper() == "COMMISSION" and r.get("tick") == tick]
-            orders = [r for r in self.transactions if str(r.get("type")).upper() == "ORDER" and r.get("tick") == tick]
+            tick, tk = tr.get("tick"), tr.get("ticker")
             qty = abs(float(tr.get("quantity") or 0))
-            price = float(tr.get("price") or 0)
-            cf = tr.get("cash_flow")
-            if cf is not None and qty and price:
-                gross = qty * price
-                if abs(abs(float(cf)) - gross) > 0.5 * 0.02 * qty and abs(abs(float(cf)) - gross) < 2 * 0.02 * qty:
-                    verdicts.append("yes (inside tender cash flow)")
-                    continue
-            if comm and not orders:
-                verdicts.append("yes (commission row at tender tick)")
-            elif not comm:
-                verdicts.append("no")
-            else:
-                verdicts.append("unclear (orders filled in the same tick)")
+            fee = self.fee(tk) if tk in self.tickers else float(self.cfg.fees.per_share)
+            comm = sum(abs(float(r.get("cash_flow") or 0)) for r in rows
+                       if str(r.get("type")).upper() == "COMMISSION" and r.get("tick") == tick)
+            filled = sum(abs(float(r.get("quantity") or 0)) for r in rows
+                         if str(r.get("type")).upper() == "ORDER" and r.get("tick") == tick)
+            excess = comm - fee * filled
+            verdicts.append("yes" if qty and excess >= 0.5 * fee * qty else "no")
         return ", ".join(verdicts)
 
     # ================================================================ logging
